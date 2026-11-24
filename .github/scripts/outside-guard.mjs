@@ -16,7 +16,12 @@
 // carries `reductions: true`. An R_ file is refused for every other kind, an L_ file for reduce.
 // Without a kind argument (the advisory run) an R_ file is refused.
 //
-// Exit 0: the guard holds. Exit 1: REFUSED, with one line saying why. Exit 3: bad usage.
+// Exit 0: the guard holds. Exit 1: REFUSED, one line per reason, each line starting `REFUSED: `.
+// The pull-request, gap and kind checks give one reason (the first). The checks of the file's text
+// (the import, plain-file and own-namespace rules) give EVERY problem they find, in file order, so
+// an author fixes all of them in one push; at most MAX_PROBLEMS lines, then `... and N more`, and
+// at most MAX_REFUSAL characters in all. The first line is the sentence a one-reason refusal gave.
+// Exit 3: bad usage.
 import { lstatSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -42,6 +47,29 @@ const LOGIN_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})(\[bot\])?$/;
 
 class Refused extends Error {}
 const refuse = (why) => { throw new Refused(why); };
+// The problems of a file's text, collected: each { at, why }, `at` its line (0 for the whole file,
+// before every line; Infinity for what is missing, after every line). Refused once, all of them.
+export const MAX_PROBLEMS = 40;
+export const MAX_REFUSAL = 6000;
+const MAX_LINE = 400;
+// A piece of the file's own text quoted in a sentence: at most 60 characters, and only letters,
+// digits, dot, underscore and apostrophe (anything else reads `?`), so what the author chose can
+// neither steer the log nor fill it (red team, 2026-11-24).
+export const tok = (x) => String(x).slice(0, 60).replace(/[^A-Za-z0-9._']/g, '?');
+const refuseAll = (problems) => {
+  if (problems.length === 0) return;
+  const all = problems.map((p, k) => ({ ...p, k })).sort((a, b) => a.at - b.at || a.k - b.k)
+    .map((p) => (p.why.length > MAX_LINE ? `${p.why.slice(0, MAX_LINE - 3)}...` : p.why));
+  const out = [];
+  let size = 0;
+  for (const why of all) {
+    // Room is kept for the last line, `... and N more`, and for a prefix naming a listed module.
+    if (out.length > 0 && (out.length === MAX_PROBLEMS || size + 1 + why.length > MAX_REFUSAL - 200)) break;
+    out.push(why); size += (out.length > 1 ? 1 : 0) + why.length;
+  }
+  if (out.length < all.length) out.push(`... and ${all.length - out.length} more`);
+  throw new Refused(out.join('\n'));
+};
 const json = (path) => { try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return refuse(`${path} is not JSON`); } };
 const moduleOf = (file) => file.slice('lean/'.length, -'.lean'.length).split('/').join('.');
 
@@ -124,10 +152,31 @@ export function checkGap(gaps, pick, file, want) {
 // import lines the word `import` may not appear at all: Lean reads imports through comments, so
 // `/- -/ import X` on a later line would still be an import. A plain rule, stricter than Lean.
 export function checkImports(bytes, allowed) {
+  const problems = [];
+  const seen = importProblems(bytes, allowed, problems);
+  refuseAll(problems);
+  return seen;
+}
+
+// The text of the file's bytes. What cannot be read as text is refused at once, alone.
+const textOf = (bytes) => {
   if (bytes.length > MAX_BYTES) refuse(`the file is larger than ${MAX_BYTES} bytes`);
   let text;
   try { text = new TextDecoder('utf-8', { fatal: true }).decode(bytes); } catch { return refuse('the file is not UTF-8 text'); }
   if (text.includes('\0')) refuse('the file holds a NUL byte');
+  plainChars(text);
+  return text;
+};
+
+// Control, invisible and direction-changing characters stop the check first and alone, as a NUL
+// does: the workflow's quoting strips ASCII control characters only (red team, 2026-11-24).
+const plainChars = (text) => {
+  if (CONTROL.test(text.replace(/\r?\n/g, ''))) refuse('the file holds control characters');
+  if (INVISIBLE.test(text)) refuse('the file holds invisible or direction-changing characters');
+};
+
+function importProblems(bytes, allowed, problems) {
+  const text = textOf(bytes);
   const lines = text.split('\n').map((l) => l.replace(/\r$/, ''));
   const ok = typeof allowed === 'function' ? { has: allowed } : new Set(allowed);
   const seen = [];
@@ -138,13 +187,13 @@ export function checkImports(bytes, allowed) {
     const m = /^import ([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)*)[ \t]*$/.exec(l);
     if (!m) break;
     const name = m[1];
-    if (!(name === 'Mathlib' || name.startsWith('Mathlib.') || ok.has(name))) refuse(`line ${i + 1}: import ${name} is not allowed (only Mathlib and the modules the gap lists)`);
-    seen.push(name);
+    if (!(name === 'Mathlib' || name.startsWith('Mathlib.') || ok.has(name))) problems.push({ at: i + 1, why: `line ${i + 1}: import ${tok(name)} is not allowed (only Mathlib and the modules the gap lists)` });
+    else seen.push(name);
   }
   for (; i < lines.length; i += 1) {
-    if (/(^|[^A-Za-z0-9_])import([^A-Za-z0-9_]|$)/.test(lines[i])) refuse(`line ${i + 1}: the word "import" after the import lines (imports are plain lines at the top, one module each)`);
+    if (/(^|[^A-Za-z0-9_])import([^A-Za-z0-9_]|$)/.test(lines[i])) problems.push({ at: i + 1, why: `line ${i + 1}: the word "import" after the import lines (imports are plain lines at the top, one module each)` });
   }
-  checkPlain(text);
+  plainProblems(text, problems);
   return seen;
 }
 
@@ -175,13 +224,34 @@ const FORBIDDEN = new RegExp([
 ].join(''), 'u');
 // The four limit options, wherever they stand, are taken out before the list is asked; every
 // other set_option, at column 0 or indented, is refused by it.
+// The matched word is printed raw only when it is EXACTLY one of these literals of our own rules
+// (string equality); any other match goes through tok() (red team, 2026-11-24).
+const RAW_WORDS = new Set([
+  '"', '«', '»', '$(', '%[', '@[', '`(tactic|', '`(term|', '`(command|', '`(conv|', '`(doElem|',
+  '#eval', '#check', '#print', '#reduce', '#synth', '#exit', '#help', '#lint', '#guard', '#guard_msgs',
+  '#find', '#simp', '#norm_num', '#conv', '#where', '#time', '#check_failure', '#adaptation_note',
+  'simproc', 'builtin_', 'native', 'bv_decide', 'ofReduce', 'reduceNat', 'reduceBool',
+  'Lean', 'System', 'IO', 'Elab', 'Meta', 'Lake', 'FS', 'Process', 'EIO',
+  '_root_', 'RealWorld', 'BaseIO', 'include_str', 'notation', 'polyrith', 'initialize',
+  'run_cmd', 'run_tac', 'run_elab', 'run_meta', 'by_elab', 'elab', 'macro', 'syntax', 'attribute',
+  'axiom', 'opaque', 'unsafe', 'partial', 'sorry', 'admit', 'implemented_by', 'extern',
+  'register_', 'declare_', 'lcProof', 'lcUnreachable', 'infix', 'prefix', 'postfix',
+  'set_option', 'binder_predicate', 'unif_hint', 'unseal', 'compile_inductive', 'irreducible_def',
+  'proof_wanted', 'mk_iff_of_inductive_prop',
+]);
+const sayWord = (w) => (RAW_WORDS.has(w) ? w : tok(w));
 const LIMIT = /set_option (maxRecDepth|maxHeartbeats|synthInstance\.maxSize|synthInstance\.maxHeartbeats) [0-9]+ in(?![A-Za-z0-9_])/gu;
 const INVISIBLE = /[​-‏‪-‮⁠-⁩﻿]/u;
 const CONTROL = /[\u0000-\u0008\u000b-\u001f\u007f]/u;
 
 export function checkPlain(text) {
-  if (CONTROL.test(text.replace(/\r?\n/g, ''))) refuse('the file holds control characters');
-  if (INVISIBLE.test(text)) refuse('the file holds invisible or direction-changing characters');
+  plainChars(text);
+  const problems = [];
+  plainProblems(text, problems);
+  refuseAll(problems);
+}
+
+function plainProblems(text, problems) {
   let theorems = 0;
   text.split('\n').forEach((raw, k) => {
     const line = raw.replace(/\r$/, '');
@@ -192,10 +262,10 @@ export function checkPlain(text) {
     // A limit option set for the whole file (no `in`) is refused, as before; the sentence names the
     // one fix, so an honest prover passes in one push (red team, 2026-11-23: the rule stays narrow).
     if (m && /^\s*set_option (maxRecDepth|maxHeartbeats|synthInstance\.maxSize|synthInstance\.maxHeartbeats) [0-9]+\s*$/u.test(line)) hint = '; a limit option holds only for one declaration: write it as set_option <option> <value> in, directly before the declaration that needs it';
-    if (m) refuse(`line ${k + 1}: "${m[0].trim()}" is not allowed in a proof file, in code or in a comment (no code that runs at build time, no new syntax, no string literals, no attributes but simp, no options but the four limits)${hint}`);
+    if (m) problems.push({ at: k + 1, why: `line ${k + 1}: "${sayWord(m[0].trim())}" is not allowed in a proof file, in code or in a comment (no code that runs at build time, no new syntax, no string literals, no attributes but simp, no options but the four limits)${hint}` });
     if (/^\s*(@\[(local )?simp\] )?((private|protected) )?theorem /u.test(line)) theorems += 1;
   });
-  if (theorems === 0) refuse('the file holds no theorem');
+  if (theorems === 0) problems.push({ at: Infinity, why: 'the file holds no theorem' });
 }
 
 // THE OWN-NAMESPACE RULE, for the file of a NEW pull request only (merged files are never edited,
@@ -237,9 +307,18 @@ export function blankComments(text) {
 }
 
 export function checkOwnNamespace(text, module) {
+  const problems = [];
+  namespaceProblems(text, module, problems);
+  refuseAll(problems);
+}
+
+// Each problem is noted and the walk goes on, keeping the depth as the author meant it (a block
+// opened where it may not be is still pushed, so its own `end` closes it and its body is not
+// reported line by line), so the next problem is found too.
+function namespaceProblems(text, module, problems) {
   const reduction = REDUCTION_MODULE_RE.test(module);
-  if (!OUTSIDE_MODULE_RE.test(module) && !reduction) refuse(`${module} is not the module of an outside proof file`);
-  if (module.endsWith('_aux')) refuse('the file name may not end in _aux (that suffix names the helper namespace of another file)');
+  if (!OUTSIDE_MODULE_RE.test(module) && !reduction) { problems.push({ at: -1, why: `${module} is not the module of an outside proof file` }); return; }
+  if (module.endsWith('_aux')) problems.push({ at: -1, why: 'the file name may not end in _aux (that suffix names the helper namespace of another file)' });
   const own = (n) => n === module || n.startsWith(`${module}.`) || n === `${module}_aux` || n.startsWith(`${module}_aux.`);
   const fix = `put every helper inside \`namespace ${module}\` ... \`end ${module}\`; only the imports and the theorem stay outside`;
   const stack = [];
@@ -248,43 +327,54 @@ export function checkOwnNamespace(text, module) {
     const code = raw.replace(/\r$/, '').replace(/[ \t]+$/, '');
     if (code.trim() === '') return;
     const at = `line ${k + 1}`;
+    const note = (why) => problems.push({ at: k + 1, why });
     if (SCOPE_WORD.test(code)) {
       const m = SCOPE_LINE.exec(code);
-      if (!m) refuse(`${at}: \`namespace\`, \`section\`, \`end\` and \`mutual\` must stand alone at the start of a line (not indented, nothing else on it); ${fix}`);
-      if (theorem) refuse(`${at}: nothing but the proof may follow the theorem ${module}; ${fix}`);
+      if (!m) { note(`${at}: \`namespace\`, \`section\`, \`end\` and \`mutual\` must stand alone at the start of a line (not indented, nothing else on it); ${fix}`); return; }
+      if (theorem) { note(`${at}: nothing but the proof may follow the theorem ${module}; ${fix}`); return; }
       if (m[1]) {
         // The checker refuses a reduction file that declares anything but its theorem (reduce-extra).
-        if (reduction) refuse(`${at}: \`namespace ${m[2]}\`; a reduction file holds its one theorem \`theorem ${module} : T1 → ... → Tk → S\` and nothing else, so it opens no namespace`);
-        if (stack.length === 0 && !own(m[2])) refuse(`${at}: \`namespace ${m[2]}\` at the top level; the only namespace allowed there is the file's own; ${fix}`);
+        if (reduction) note(`${at}: \`namespace ${tok(m[2])}\`; a reduction file holds its one theorem \`theorem ${module} : T1 → ... → Tk → S\` and nothing else, so it opens no namespace`);
+        else if (stack.length === 0 && !own(m[2])) note(`${at}: \`namespace ${tok(m[2])}\` at the top level; the only namespace allowed there is the file's own; ${fix}`);
         stack.push({ kind: 'namespace', name: m[2] });
       } else if (m[3]) {
-        if (stack.length === 0) refuse(`${at}: a section at the top level; open it inside the file's own namespace; ${fix}`);
+        if (stack.length === 0) note(`${at}: a section at the top level; open it inside the file's own namespace; ${fix}`);
         stack.push({ kind: 'section', name: m[4] });
       } else if (m[7]) {
-        if (stack.length === 0) refuse(`${at}: \`mutual\` at the top level; ${fix}`);
+        if (stack.length === 0) note(`${at}: \`mutual\` at the top level; ${fix}`);
         stack.push({ kind: 'mutual' });
       } else {
         const top = stack.pop();
-        if (!top) refuse(`${at}: \`end\` with nothing open to close; ${fix}`);
-        if (top.kind === 'mutual' ? m[6] !== undefined : m[6] !== top.name) refuse(`${at}: \`end${m[6] ? ` ${m[6]}` : ''}\` does not name what it closes (${top.kind === 'mutual' ? '`end` alone closes `mutual`' : `write \`end${top.name ? ` ${top.name}` : ''}\``})`);
+        if (!top) note(`${at}: \`end\` with nothing open to close; ${fix}`);
+        else if (top.kind === 'mutual' ? m[6] !== undefined : m[6] !== top.name) note(`${at}: \`end${m[6] ? ` ${tok(m[6])}` : ''}\` does not name what it closes (${top.kind === 'mutual' ? '`end` alone closes `mutual`' : `write \`end${top.name ? ` ${tok(top.name)}` : ''}\``})`);
       }
       return;
     }
     if (theorem) {
       const w = AFTER_THEOREM.exec(code);
-      if (w) refuse(`${at}: "${w[0]}" after the theorem ${module}; nothing but its proof may follow it; ${fix}`);
+      if (w) note(`${at}: "${tok(w[0])}" after the theorem ${module}; nothing but its proof may follow it; ${fix}`);
       return;
     }
     if (stack.length > 0) return;
     if (/^import [^ \t]+$/u.test(code) || TOP_LIMIT.test(code)) return;
     if (/^open[ \t]/u.test(code)) {
-      if (/[ \t]in[ \t]+\S/u.test(code)) refuse(`${at}: an \`open ... in\` line must end with \`in\`, with the theorem on the next line; ${fix}`);
+      if (/[ \t]in[ \t]+\S/u.test(code)) note(`${at}: an \`open ... in\` line must end with \`in\`, with the theorem on the next line; ${fix}`);
       return;
     }
     if (new RegExp(String.raw`^theorem ${module.replace(/\./g, '\\.')}(?![\p{L}\p{N}_'!?.])`, 'u').test(code)) { theorem = true; return; }
-    refuse(`${at}: a declaration or command outside the file's own namespace (at the top level only imports, \`open\` lines, the four limit options, \`namespace ${module}\` and \`theorem ${module}\` may stand); ${fix}`);
+    note(`${at}: a declaration or command outside the file's own namespace (at the top level only imports, \`open\` lines, the four limit options, \`namespace ${module}\` and \`theorem ${module}\` may stand); ${fix}`);
   });
-  if (!theorem) refuse(`the theorem must stand at the top level, last, written with its full name: \`theorem ${module} ...\`; ${fix}`);
+  if (!theorem) problems.push({ at: Infinity, why: `the theorem must stand at the top level, last, written with its full name: \`theorem ${module} ...\`; ${fix}` });
+}
+
+// The whole file check of the `imports` command: the import, plain-file and own-namespace rules
+// read the same text, and every problem of all three is refused at once, in file order.
+export function checkProofFile(bytes, allowed, module) {
+  const problems = [];
+  const seen = importProblems(bytes, allowed, problems);
+  namespaceProblems(new TextDecoder().decode(bytes), module, problems);
+  refuseAll(problems);
+  return seen;
 }
 
 // WHAT THE BASE STEP MAY BUILD. A gap may list modules that outsiders wrote (anything under
@@ -357,10 +447,10 @@ export function importClosure(listed, read, judged) {
   const outside = new Set(), base = new Set();
   const visit = (m, from) => {
     if (outside.has(m) || base.has(m)) return;
-    if (!BASE_ROOT_RE.test(m)) refuse(`${from ? `${from} imports` : 'the gap lists'} ${m}, which is not under the PEqualNP root`);
-    if (m === judged) refuse(`${from ? `${from} imports` : 'the gap lists'} ${m}, the file being judged`);
+    if (!BASE_ROOT_RE.test(m)) refuse(`${from ? `${from} imports` : 'the gap lists'} ${tok(m)}, which is not under the PEqualNP root`);
+    if (m === judged) refuse(`${from ? `${from} imports` : 'the gap lists'} ${tok(m)}, the file being judged`);
     const bytes = read(m);
-    if (bytes === null) refuse(`${from ? `${from} imports` : 'the gap lists'} ${m}, which is not a plain file of the base tree`);
+    if (bytes === null) refuse(`${from ? `${from} imports` : 'the gap lists'} ${tok(m)}, which is not a plain file of the base tree`);
     if (isOutside(m)) {
       if (!OUTSIDE_MODULE_RE.test(m)) refuse(`${m} is not the name of an outside proof file`);
       outside.add(m);
@@ -401,8 +491,7 @@ const main = () => {
   } else if (cmd === 'imports' && (a.length === 3 || a.length === 4)) {
     checkFileKind(a[2], a[3]);
     const bytes = readFileSync(a[0]);
-    const seen = checkImports(bytes, json(a[1]));
-    checkOwnNamespace(new TextDecoder().decode(bytes), moduleOf(a[2]));
+    const seen = checkProofFile(bytes, json(a[1]), moduleOf(a[2]));
     process.stdout.write(`imports allowed: ${seen.join(' ') || '(none)'}\n`);
   } else if (cmd === 'closure' && (a.length === 4 || a.length === 5)) {
     const [baseDir, importsPath, judgedFile, out] = a;
@@ -430,7 +519,7 @@ const main = () => {
 if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) {
   try { main(); } catch (e) {
     if (!(e instanceof Refused)) throw e;
-    process.stdout.write(`REFUSED: ${e.message}\n`);
+    process.stdout.write(e.message.split('\n').map((l) => `REFUSED: ${l}\n`).join(''));
     process.exit(1);
   }
 }

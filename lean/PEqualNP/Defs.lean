@@ -61,6 +61,7 @@ import PEqualNP.Defs.SharingOrder
 import PEqualNP.Defs.NotPremium
 import PEqualNP.Defs.NotBracket
 import PEqualNP.Defs.PairShadow
+import PEqualNP.Defs.SplitCount
 import PEqualNP.Defs.InvisibleWire
 import PEqualNP.Defs.SharedOr
 import PEqualNP.Defs.CleanedNonEdge
@@ -69,6 +70,17 @@ import PEqualNP.Defs.CarriedProduct
 import PEqualNP.Defs.TopForm
 import PEqualNP.Defs.SyntacticMultilinear
 import PEqualNP.Defs.TopFormNames
+import PEqualNP.Defs.HeptadCover
+import PEqualNP.Defs.ReadK
+import PEqualNP.Defs.GenericRejection
+import PEqualNP.Defs.CrossAnd
+import PEqualNP.Defs.ReadKJoin
+import PEqualNP.Defs.SharedBlockCost
+import PEqualNP.Defs.ReadTwo
+import PEqualNP.Defs.LratEncoding
+import PEqualNP.Defs.Core
+import PEqualNP.Defs.PointTypes
+import PEqualNP.Defs.FactorSubst
 
 /-!
 # The definitions root
